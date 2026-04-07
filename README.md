@@ -22,6 +22,7 @@ strictly sequential, leakage-free predictions.
 - Matplotlib / Seaborn
 
 ## 📁 Project Structure
+```
 Vectron/
 ├── data/               # Raw and processed data
 ├── notebooks/          # EDA and modeling notebooks
@@ -33,6 +34,7 @@ Vectron/
 ├── submissions/        # CSV submission files
 ├── requirements.txt    # Dependencies
 └── README.md
+```
 
 ## 📊 Approach
 1. Exploratory Data Analysis
