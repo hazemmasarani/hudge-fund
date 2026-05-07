@@ -1,32 +1,3 @@
-"""
-Model_Final_v2.py
------------------
-Improvements over v1:
-
-[FEATURE ENGINEERING]
-  1. Rolling min/max/range/position (oscillator) on ALL lag_feats, not just 2
-  2. Horizon-aligned lag added: shift(horizon) — directly economically meaningful
-  3. Multi-lag momentum diffs: feat[t] - feat[t-5], feat[t] - feat[t-10]
-  4. EWM spans scaled to horizon: longer spans for h=10,25
-  5. Cross-sectional normalization extended to spread features (d_cg_by, d_s_t, d_al_cg)
-  6. feature_a interaction: time-to-expiry weighted z-score (options intuition)
-  7. Rolling features on ALL lag_feats, not just feature_al/am
-  8. min_periods fixed: max(3, w//2) instead of 1 to avoid single-point noise
-  9. Rolling median added (robust to outliers vs mean)
-  10. Autocorrelation at lag-1 within rolling window (mean-reversion signal)
-
-[MODEL]
-  11. More seeds (7 vs 5) — reduces variance on ensemble
-  12. Horizon 1 gets stronger regularization (higher L2, fewer leaves)
-      since h=1 is highest noise
-
-[VALIDATION]
-  13. Dual holdout check: score on 3001-3500 vs 3501+ to detect val instability
-
-Usage:
-    python Model_Final_v2.py --train train.parquet --test test.parquet
-"""
-
 import argparse
 import warnings
 import gc
@@ -36,14 +7,11 @@ import lightgbm as lgb
 
 warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-SEEDS         = [42, 2024, 12345, 99, 420, 7, 314]   # FIX 11: 7 seeds vs 5
+SEEDS         = [42, 2024, 12345, 99, 420]
 HORIZONS      = [1, 3, 10, 25]
-VAL_THRESHOLD = 3500
+VAL_THRESHOLD = 3500   # train on <= 3500, validate on > 3500
 
+# Base parameters shared across all horizons
 BASE_PARAMS = {
     "objective"       : "regression",
     "metric"          : "rmse",
@@ -57,15 +25,20 @@ BASE_PARAMS = {
     "n_jobs"          : -1,
 }
 
-# FIX 12: h=1 gets tighter regularization (most noise, least signal)
+# Horizon-specific overrides.
+# Short horizons (1, 3) — high noise, strong regularisation needed:
+#   fewer leaves, more samples per leaf, higher L2
+# Long horizons (10, 25) — smoother signal, more model flexibility:
+#   more leaves, fewer samples per leaf, lower L2
 HORIZON_PARAMS = {
-    1:  {"num_leaves": 60,  "min_child_samples": 300, "lambda_l2": 14.0},  # tighter than v1
+    1:  {"num_leaves": 70,  "min_child_samples": 250, "lambda_l2": 12.0},
     3:  {"num_leaves": 75,  "min_child_samples": 225, "lambda_l2": 11.0},
     10: {"num_leaves": 85,  "min_child_samples": 180, "lambda_l2":  9.0},
     25: {"num_leaves": 90,  "min_child_samples": 150, "lambda_l2":  8.0},
 }
 
 def get_params(horizon):
+    """Merge base params with horizon-specific overrides."""
     return {**BASE_PARAMS, **HORIZON_PARAMS[horizon]}
 
 NON_FEATURE_COLS = {
@@ -87,9 +60,6 @@ def kaggle_score(y_true, y_pred, weights):
         return 0.0
     return float(np.sqrt(1.0 - np.clip(num / den, 0.0, 1.0)))
 
-# ---------------------------------------------------------------------------
-# Feature engineering
-# ---------------------------------------------------------------------------
 
 def build_features(df, horizon):
     df = df.copy()
@@ -97,18 +67,32 @@ def build_features(df, horizon):
                          "horizon", "ts_index"]).reset_index(drop=True)
 
     group_cols    = ["code", "sub_code", "sub_category", "horizon"]
+    group_id_cols = ["code", "sub_code"]   # tighter group for lags
 
     # ── 1. feature_a derived features ────────────────────────────────────────
-    df["feature_a_pct"]     = df["feature_a"] / 250.0
+    # feature_a is a countdown (212 → 0) — time-to-expiry proxy.
+    #
+    # LEGAL normalisation: divide by 250 (a fixed constant > observed max of 213).
+    # Why NOT transform("max"): scanning the full group for a max value
+    # looks at future rows — a row at t=100 would "know" the value at t=3000.
+    # Dividing by a fixed constant is always legal — no future data used.
+    df["feature_a_pct"] = df["feature_a"] / 250.0
+
+    # At time t, this is the largest countdown value seen so far (1..t)
     df["feature_a_exp_max"] = df.groupby(group_cols)["feature_a"].transform(
         lambda x: x.expanding().max()
     )
+    # Fraction relative to expanding max — legal, uses only past data
     df["feature_a_exp_pct"] = df["feature_a"] / (df["feature_a_exp_max"] + 1e-7)
-    df["feature_a_diff"]    = df.groupby(group_cols)["feature_a"].transform(
+
+    # Rate of change of countdown — legal, just diff between consecutive rows
+    df["feature_a_diff"] = df.groupby(group_cols)["feature_a"].transform(
         lambda x: x.diff()
     )
 
-    # ── 2. Expanding means of y_target ───────────────────────────────────────
+    # ── 2. Expanding means of y_target — CORRECT sequential stats ────────────
+    # shift(1) before expanding() = only rows BEFORE current row inform it
+    # This satisfies Y^t = pred(X[1:t]) strictly
     for col, grp in [("sub_category", "sub_category"),
                      ("code", "code"),
                      ("sub_code", "sub_code")]:
@@ -121,126 +105,85 @@ def build_features(df, horizon):
             .transform(lambda x: x.shift(1).expanding().std())
         )
 
-    # ── 3. Spread / interaction features ─────────────────────────────────────
+    # ── 3. Spread / interaction features ────────────────────────────────────
+    # These use original features — always legal
     df["d_al_am"]  = df["feature_al"] - df["feature_am"]
     df["r_al_am"]  = df["feature_al"] / (df["feature_am"].abs() + 1e-7)
     df["d_cg_by"]  = df["feature_cg"] - df["feature_by"]
     df["d_s_t"]    = df["feature_s"]  - df["feature_t"]
     df["d_al_cg"]  = df["feature_al"] - df["feature_cg"]
 
-    # ── 4. Cross-sectional normalisation ─────────────────────────────────────
-    # FIX 6: Added d_cg_by, d_s_t, d_al_cg to cs_cols (were missing in v1)
+    # ── 4. Cross-sectional normalisation within ts_index ────────────────────
+    # At time t, comparing across instruments is legal — same timestamp
     cs_cols = ["feature_al", "feature_am", "feature_cg",
-               "feature_by", "d_al_am", "d_cg_by", "d_s_t", "d_al_cg"]
+               "feature_by", "d_al_am"]
     for col in cs_cols:
-        if col not in df.columns:
-            continue
         grp = df.groupby("ts_index")[col]
-        df[f"{col}_cs_mean"]  = grp.transform("mean")
-        df[f"{col}_cs_std"]   = grp.transform("std")
-        df[f"{col}_z"]        = (df[col] - df[f"{col}_cs_mean"]) / (df[f"{col}_cs_std"] + 1e-7)
-        df[f"{col}_rank"]     = grp.rank(pct=True)
-        df[f"{col}_ts_min"]   = grp.transform("min")
-        df[f"{col}_ts_max"]   = grp.transform("max")
-        df[f"{col}_dist_min"] = df[col] - df[f"{col}_ts_min"]
-        df[f"{col}_dist_max"] = df[f"{col}_ts_max"] - df[col]
+        df[f"{col}_cs_mean"] = grp.transform("mean")
+        df[f"{col}_cs_std"]  = grp.transform("std")
+        df[f"{col}_z"]       = (
+            (df[col] - df[f"{col}_cs_mean"]) /
+            (df[f"{col}_cs_std"] + 1e-7)
+        )
+        df[f"{col}_rank"]    = grp.rank(pct=True)
+        df[f"{col}_ts_min"]  = grp.transform("min")
+        df[f"{col}_ts_max"]  = grp.transform("max")
+        df[f"{col}_dist_min"]= df[col] - df[f"{col}_ts_min"]
+        df[f"{col}_dist_max"]= df[f"{col}_ts_max"] - df[col]
 
-    # FIX 7: feature_a time-to-expiry interaction with key z-score
-    # Intuition: near expiry (feature_a → 0), cross-sectional rank matters more
-    if "feature_al_z" in df.columns:
-        df["feature_a_al_z_interact"] = df["feature_a_pct"] * df["feature_al_z"]
-    if "feature_cg_z" in df.columns:
-        df["feature_a_cg_z_interact"] = df["feature_a_pct"] * df["feature_cg_z"]
-
-    # ── 5. Lags of original features ──────────────────────────────────────────
+    # ── 5. Lags of original features ─────────────────────────────────────────
+    # shift(k) within group: row t sees value at t-k. Strictly legal.
     lag_feats = ["feature_al", "feature_am", "feature_cg",
                  "feature_by", "feature_s", "feature_t"]
-
     for feat in lag_feats:
         if feat not in df.columns:
             continue
-
-        # FIX 2: Added horizon-aligned lag — directly meaningful economically
-        lag_set = sorted(set([1, 3, 5, 10, horizon]))
-        for lag in lag_set:
-            df[f"{feat}_lag_{lag}"] = df.groupby(group_cols)[feat].shift(lag)
-
-        # diff_1 (short momentum)
+        for lag in [1, 3, 5, 10]:
+            df[f"{feat}_lag_{lag}"] = (
+                df.groupby(group_cols)[feat].shift(lag)
+            )
+        # Difference (momentum)
         df[f"{feat}_diff_1"] = df.groupby(group_cols)[feat].diff(1)
+        # Percent change
         df[f"{feat}_pct_1"]  = df.groupby(group_cols)[feat].pct_change(1)
 
-        # FIX 5: Multi-lag momentum diffs (medium-term)
-        df[f"{feat}_diff_5"]  = df.groupby(group_cols)[feat].transform(
-            lambda x: x - x.shift(5)
-        )
-        df[f"{feat}_diff_10"] = df.groupby(group_cols)[feat].transform(
-            lambda x: x - x.shift(10)
-        )
-
-    # ── 6. Rolling stats — ALL lag_feats, not just 2 ──────────────────────────
-    # FIX 1: Expanded to all lag_feats
-    # FIX 8: min_periods = max(3, w//2) instead of 1
-    # FIX 9: Added rolling median (robust to outliers)
-    # FIX 10: Added rolling min/max/range/normalized position (oscillator)
-    for feat in lag_feats:
-        if feat not in df.columns:
-            continue
+    # ── 6. Rolling stats of original features ───────────────────────────────
+    # Rolling on original features is legal — no y_target involved
+    # min_periods=1 to avoid excessive NaN
+    roll_feats = ["feature_al", "feature_am"]
+    for feat in roll_feats:
         for w in [5, 10, 20]:
-            mp = max(3, w // 2)   # FIX 8
-            grp_series = df.groupby(group_cols)[feat]
-
-            df[f"{feat}_roll_mean_{w}"]   = grp_series.transform(
-                lambda x: x.rolling(w, min_periods=mp).mean())
-            df[f"{feat}_roll_std_{w}"]    = grp_series.transform(
-                lambda x: x.rolling(w, min_periods=mp).std())
-            df[f"{feat}_roll_median_{w}"] = grp_series.transform(   # FIX 9
-                lambda x: x.rolling(w, min_periods=mp).median())
-            rmin = grp_series.transform(
-                lambda x: x.rolling(w, min_periods=mp).min())
-            rmax = grp_series.transform(
-                lambda x: x.rolling(w, min_periods=mp).max())
-            df[f"{feat}_roll_min_{w}"]   = rmin                      # FIX 10
-            df[f"{feat}_roll_max_{w}"]   = rmax
-            df[f"{feat}_roll_range_{w}"] = rmax - rmin
-            # Normalized oscillator: where is current value in [min, max]?
-            # 0 = at rolling low, 1 = at rolling high — real quant signal
-            df[f"{feat}_roll_pos_{w}"]   = (
-                (df[feat] - rmin) / (rmax - rmin + 1e-7)
+            df[f"{feat}_roll_mean_{w}"] = (
+                df.groupby(group_cols)[feat]
+                .transform(lambda x: x.rolling(w, min_periods=1).mean())
+            )
+            df[f"{feat}_roll_std_{w}"] = (
+                df.groupby(group_cols)[feat]
+                .transform(lambda x: x.rolling(w, min_periods=1).std())
             )
 
-    # ── 7. EWM — spans scaled to horizon ──────────────────────────────────────
-    # FIX 4: longer spans for long horizons (slow signal needs slower decay)
-    if horizon <= 3:
-        spans = [3, 5, 10]
-    elif horizon <= 10:
-        spans = [5, 10, 20]
-    else:  # horizon == 25
-        spans = [5, 10, 20, 30]
-
-    for feat in ["feature_al", "feature_am", "feature_cg", "feature_by"]:
-        if feat not in df.columns:
-            continue
+    # ── 7. EWM of original features ──────────────────────────────────────────
+    spans = [3, 5] if horizon <= 3 else [5, 10]
+    for feat in ["feature_al", "feature_am"]:
         for span in spans:
             df[f"{feat}_ewm_{span}"] = (
                 df.groupby(group_cols)[feat]
                 .transform(lambda x: x.ewm(span=span, adjust=False).mean())
             )
-            # EWM std — captures local volatility with exponential decay
-            df[f"{feat}_ewm_std_{span}"] = (
-                df.groupby(group_cols)[feat]
-                .transform(lambda x: x.ewm(span=span, adjust=False).std())
+
+    # ── 8. Rolling volatility of cross-sectional z-scores ──────────────────
+    for col in ["feature_al_z", "feature_cg_z"]:
+        if col in df.columns:
+            df[f"{col}_roll_std_10"] = (
+                df.groupby(group_cols)[col]
+                .transform(lambda x: x.rolling(10, min_periods=2).std())
+            )
+            df[f"{col}_roll_std_20"] = (
+                df.groupby(group_cols)[col]
+                .transform(lambda x: x.rolling(20, min_periods=2).std())
             )
 
-    # ── 8. Rolling volatility of cross-sectional z-scores ────────────────────
-    for col in ["feature_al_z", "feature_cg_z", "d_al_am_z"]:
-        if col in df.columns:
-            for w in [10, 20]:
-                df[f"{col}_roll_std_{w}"] = (
-                    df.groupby(group_cols)[col]
-                    .transform(lambda x: x.rolling(w, min_periods=max(3, w//2)).std())
-                )
-
-    # ── 9. Time features ──────────────────────────────────────────────────────
+    # ── 9. Time features — deterministic, always legal ───────────────────────
     df["ts_log"]     = np.log1p(df["ts_index"])
     df["ts_mod_30"]  = df["ts_index"] % 30
     df["ts_mod_90"]  = df["ts_index"] % 90
@@ -251,24 +194,29 @@ def build_features(df, horizon):
     df["ts_horizon"] = df["ts_index"] * df["horizon"]
 
     # ── 10. Sub-category dummies ──────────────────────────────────────────────
-    sub_cat_dummies = pd.get_dummies(df["sub_category"], prefix="subcat", dtype=int)
+    sub_cat_dummies = pd.get_dummies(
+        df["sub_category"], prefix="subcat", dtype=int
+    )
     df = pd.concat([df, sub_cat_dummies], axis=1)
 
     df = df.fillna(0)
     return df
 
-# ---------------------------------------------------------------------------
-# Train one horizon
-# ---------------------------------------------------------------------------
 
 def train_horizon(train_path, test_path, horizon):
     print(f"\n{'='*60}")
     print(f"  HORIZON {horizon}")
     print(f"{'='*60}")
 
-    train_raw = pd.read_parquet(train_path).query(f"horizon == {horizon}").copy()
-    test_raw  = pd.read_parquet(test_path).query(f"horizon == {horizon}").copy()
+    # Load horizon slice
+    train_raw = pd.read_parquet(train_path).query(
+        f"horizon == {horizon}"
+    ).copy()
+    test_raw = pd.read_parquet(test_path).query(
+        f"horizon == {horizon}"
+    ).copy()
 
+    # Add group_id and placeholder y_target/weight for test
     for df in [train_raw, test_raw]:
         df["group_id"] = (
             df["code"].astype(str) + "_" +
@@ -280,12 +228,14 @@ def train_horizon(train_path, test_path, horizon):
         if col not in test_raw.columns:
             test_raw[col] = 0.0
 
-    group_cols_key = ["code", "sub_code", "sub_category", "horizon"]
-
-    # Expanding mean contamination fix (unchanged — correct logic)
+    # Step 1: Feature engineering on training data
     train_fe = build_features(train_raw.copy(), horizon)
 
+    # Extract last expanding mean per group from training
+    # These represent the complete historical mean up to end of training
     exp_cols = [c for c in train_fe.columns if "_exp_mean" in c or "_exp_std" in c]
+    group_cols_key = ["code", "sub_code", "sub_category", "horizon"]
+
     last_exp_stats = (
         train_fe.sort_values(group_cols_key + ["ts_index"])
         .groupby(group_cols_key)[exp_cols]
@@ -293,6 +243,9 @@ def train_horizon(train_path, test_path, horizon):
         .reset_index()
     )
 
+    # Step 2: Feature engineering on test data
+    # Expanding means computed on test data are meaningless (y_target=0)
+    # so we will overwrite them with the correct last training values
     test_fe = build_features(
         pd.concat([train_raw, test_raw], ignore_index=True)
         .sort_values(group_cols_key + ["ts_index"])
@@ -301,21 +254,25 @@ def train_horizon(train_path, test_path, horizon):
     )
     test_fe = test_fe[test_fe["ts_index"] > train_raw["ts_index"].max()].copy()
 
+    # Overwrite test expanding mean columns with last training values
+    # This replaces the contaminated values with the correct historical means
     if exp_cols:
         test_fe = test_fe.drop(columns=exp_cols)
         test_fe = test_fe.merge(last_exp_stats, on=group_cols_key, how="left")
+        # Fill any groups that appear only in test (no training history) with 0
         test_fe[exp_cols] = test_fe[exp_cols].fillna(0)
 
     print(f"  Expanding mean fix: {len(exp_cols)} columns corrected for test set")
 
+    # Feature columns
     feat_cols = [c for c in train_fe.columns if c not in NON_FEATURE_COLS]
-    h_params  = get_params(horizon)
+    h_params = get_params(horizon)
     print(f"  Features  : {len(feat_cols)}")
     print(f"  Config    : leaves={h_params['num_leaves']}  "
           f"min_child={h_params['min_child_samples']}  "
           f"L2={h_params['lambda_l2']}")
 
-    # Time-based split
+    # Time-based train/val split
     tr_mask  = train_fe["ts_index"] <= VAL_THRESHOLD
     val_mask = train_fe["ts_index"] >  VAL_THRESHOLD
 
@@ -325,24 +282,21 @@ def train_horizon(train_path, test_path, horizon):
     X_val = train_fe.loc[val_mask, feat_cols]
     y_val = train_fe.loc[val_mask, "y_target"]
     w_val = train_fe.loc[val_mask, "weight"]
-
-    # FIX 13: Dual holdout — check if val score is stable across two sub-windows
-    mid = (train_fe.loc[val_mask, "ts_index"].min() +
-           train_fe.loc[val_mask, "ts_index"].max()) // 2
-    val_early_mask = train_fe["ts_index"].between(VAL_THRESHOLD + 1, mid)
-    val_late_mask  = train_fe["ts_index"] > mid
-
     X_test = test_fe[feat_cols]
     ids    = test_fe["id"]
 
     print(f"  Train: {len(X_tr):,}  Val: {len(X_val):,}  Test: {len(X_test):,}")
+
+    # Use raw weights directly.
     print(f"  Weight p50={w_tr.median():.1f}  p99={w_tr.quantile(0.99):.0f}  max={w_tr.max():.0f}")
 
+    # Multi-seed ensemble
     val_preds  = np.zeros(len(X_val))
     test_preds = np.zeros(len(X_test))
 
     for i, seed in enumerate(SEEDS, 1):
         print(f"  Seed {i}/{len(SEEDS)} (seed={seed})...", end=" ", flush=True)
+
         model = lgb.LGBMRegressor(**{**get_params(horizon), "random_state": seed})
         model.fit(
             X_tr, y_tr,
@@ -354,32 +308,13 @@ def train_horizon(train_path, test_path, horizon):
                 lgb.log_evaluation(period=99999),
             ],
         )
+
         val_preds  += model.predict(X_val)  / len(SEEDS)
         test_preds += model.predict(X_test) / len(SEEDS)
         print("done")
 
     h_score = kaggle_score(y_val, val_preds, w_val)
-
-    # FIX 13: Dual holdout diagnostic
-    val_fe = train_fe.loc[val_mask].copy()
-    val_fe["pred"] = val_preds
-    early_idx = val_fe["ts_index"] <= mid
-    late_idx  = val_fe["ts_index"] >  mid
-    score_early = kaggle_score(
-        val_fe.loc[early_idx, "y_target"],
-        val_fe.loc[early_idx, "pred"],
-        val_fe.loc[early_idx, "weight"]
-    )
-    score_late = kaggle_score(
-        val_fe.loc[late_idx, "y_target"],
-        val_fe.loc[late_idx, "pred"],
-        val_fe.loc[late_idx, "weight"]
-    )
-    print(f"\n  Horizon {horizon} overall val score : {h_score:.5f}")
-    print(f"  Horizon {horizon} early val score   : {score_early:.5f}  (ts <= {mid})")
-    print(f"  Horizon {horizon} late  val score   : {score_late:.5f}  (ts >  {mid})")
-    if abs(score_early - score_late) > 0.02:
-        print(f"  *** WARNING: early/late gap > 0.02 — val may not be representative ***")
+    print(f"\n  Horizon {horizon} local score: {h_score:.5f}")
 
     del train_raw, test_raw, train_fe, test_fe
     del X_tr, X_val
@@ -391,11 +326,9 @@ def train_horizon(train_path, test_path, horizon):
         h_score,
     )
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def run(train_path, test_path, output="predictions.csv"):
+
     all_test_preds = []
     all_y, all_p, all_w = [], [], []
     horizon_scores = {}
